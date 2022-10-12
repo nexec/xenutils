@@ -15,6 +15,9 @@
 #include <xen/public/xen.h>
 
 #include <domain.h>
+#include <xen/public/io/console.h>
+#include <xen/public/io/xs_wire.h>
+#include <xen/events.h>
 
 #include <init.h>
 #include <kernel.h>
@@ -22,10 +25,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <domain_configs/domd_config.h>
-#include <domain_configs/domu_config.h>
+#include "domain_configs/domd_config.h"
+#include "domain_configs/domu_config.h"
+#include "message_handlers.h"
+#include "storage.h"
+#include "processing.h"
+#include "domain.h"
+
+static int dom_num = 0;
+
+#define STACK_SIZE_PER_DOM (32 * 1024)
 
 static sys_dlist_t domain_list = SYS_DLIST_STATIC_INIT(&domain_list);
+K_MUTEX_DEFINE(dl_mutex);
 
 static void arch_prepare_domain_cfg(struct xen_domain_cfg *dom_cfg,
 				    struct xen_arch_domainconfig *arch_cfg)
@@ -65,20 +77,7 @@ static int allocate_domain_evtchns(struct xen_domain *domain)
 	int rc;
 
 	/* TODO: Alloc all required evtchns */
-	rc = evtchn_alloc_unbound(domain->domid, 0);
-	if (rc < 0) {
-		printk("failed to alloc evtchn for domain #%d console, rc = %d\n", domain->domid,
-		       rc);
-		return rc;
-	}
-	domain->console_evtchn = rc;
-
-	rc = hvm_set_parameter(HVM_PARAM_CONSOLE_EVTCHN, domain->domid, domain->console_evtchn);
-	if (rc) {
-		printk("Failed to set domain console evtchn param, rc= %d\n", rc);
-	}
-
-	rc = evtchn_alloc_unbound(domain->domid, 0);
+	rc = evtchn_alloc_unbound(domain->domid, DOMID_SELF);
 	if (rc < 0) {
 		printk("failed to alloc evtchn for domain #%d console, rc = %d\n", domain->domid,
 		       rc);
@@ -86,10 +85,19 @@ static int allocate_domain_evtchns(struct xen_domain *domain)
 	}
 	domain->xenbus_evtchn = rc;
 
-	rc = hvm_set_parameter(HVM_PARAM_STORE_EVTCHN, domain->domid, domain->xenbus_evtchn);
-	if (rc) {
-		printk("Failed to set domain xenbus evtchn param, rc= %d\n", rc);
+	printk("Generated remote_domid=%d, xenbus_evtchn=%d\n", domain->domid,
+	       domain->xenbus_evtchn);
+
+	rc = evtchn_alloc_unbound(domain->domid, DOMID_SELF);
+	if (rc < 0) {
+		printk("failed to alloc evtchn for domain #%d console, rc = %d\n", domain->domid,
+		       rc);
+		return rc;
 	}
+	domain->console_evtchn = rc;
+
+	printk("Generated remote_domid=%d, console evtchn=%d\n", domain->domid,
+	       domain->console_evtchn);
 
 	return 0;
 }
@@ -343,6 +351,40 @@ int assign_dtdevs(int domid, char *dtdevs[], int nr_dtdevs)
 	return rc;
 }
 
+int map_domain_xenstore_ring(struct xen_domain *domain)
+{
+	void *mapped_ring;
+	xen_pfn_t ring_pfn, idx;
+	int err, rc;
+
+	mapped_ring = k_aligned_alloc(XEN_PAGE_SIZE, XEN_PAGE_SIZE);
+	if (!mapped_ring) {
+		printk("Failed to alloc memory for domain #%d console ring buffer\n",
+		       domain->domid);
+		return -ENOMEM;
+	}
+
+	memset(mapped_ring, 0, XEN_PAGE_SIZE);
+	ring_pfn = virt_to_pfn(mapped_ring);
+	idx = PHYS_PFN(GUEST_MAGIC_BASE) + XENSTORE_PFN_OFFSET;
+
+	/* adding single page, but only xatpb can map with foreign domid */
+	rc = xendom_add_to_physmap_batch(DOMID_SELF, domain->domid, XENMAPSPACE_gmfn_foreign, 1,
+					 &idx, &ring_pfn, &err);
+	if (rc) {
+		printk("Failed to map xenstore ring buffer of domain #%d - rc = %d\n",
+		       domain->domid, rc);
+		return rc;
+	}
+
+	domain->domint = mapped_ring;
+	struct xenstore_domain_interface *intf = (struct xenstore_domain_interface *)domain->domint;
+	intf->server_features = XENSTORE_SERVER_FEATURE_RECONNECTION;
+	intf->connection = XENSTORE_CONNECTED;
+
+	return 0;
+}
+
 int map_domain_console_ring(struct xen_domain *domain)
 {
 	void *mapped_ring;
@@ -357,6 +399,7 @@ int map_domain_console_ring(struct xen_domain *domain)
 	}
 
 	ring_pfn = virt_to_pfn(mapped_ring);
+	memset(mapped_ring, 0, XEN_PAGE_SIZE);
 	idx = PHYS_PFN(GUEST_MAGIC_BASE) + CONSOLE_PFN_OFFSET;
 
 	/* adding single page, but only xatpb can map with foreign domid */
@@ -401,8 +444,13 @@ uint32_t parse_domid(size_t argc, char **argv)
 	return 0;
 }
 
+extern int init_domain_console(struct xen_domain *domain);
 extern int start_domain_console(struct xen_domain *domain);
-extern int stop_domain_console(void);
+extern int stop_domain_console(struct xen_domain *domain);
+
+extern void init_root(void);
+extern int start_domain_stored(struct xen_domain *domain);
+extern int stop_domain_stored(struct xen_domain *domain);
 
 int domu_console_start(const struct shell *shell, size_t argc, char **argv)
 {
@@ -415,13 +463,13 @@ int domu_console_start(const struct shell *shell, size_t argc, char **argv)
 
 	domid = parse_domid(argc, argv);
 	if (!domid) {
-		printk("Invalid domid passed to create cmd\n");
+		shell_error(shell, "Invalid domid passed to create cmd\n");
 		return -EINVAL;
 	}
 
 	domain = domid_to_domain(domid);
 	if (!domain) {
-		printk("No domain with domid = %u is present\n", domid);
+		shell_error(shell, "No domain with domid = %u is present\n", domid);
 		/* Domain with requested domid is not present in list */
 		return -EINVAL;
 	}
@@ -431,7 +479,27 @@ int domu_console_start(const struct shell *shell, size_t argc, char **argv)
 
 int domu_console_stop(const struct shell *shell, size_t argc, char **argv)
 {
-	return stop_domain_console();
+	uint32_t domid = 0;
+	struct xen_domain *domain;
+
+	if (argc < 3 || argc > 4) {
+		return -EINVAL;
+	}
+
+	domid = parse_domid(argc, argv);
+	if (!domid) {
+		shell_error(shell, "Invalid domid passed to create cmd\n");
+		return -EINVAL;
+	}
+
+	domain = domid_to_domain(domid);
+	if (!domain) {
+		shell_error(shell, "No domain with domid = %u is present\n", domid);
+		/* Domain with requested domid is not present in list */
+		return -EINVAL;
+	}
+
+	return stop_domain_console(domain);
 }
 
 #define LOAD_ADDR_OFFSET 0x80000
@@ -454,14 +522,22 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
+	if (dom_num >= DOM_MAX) {
+		printk("Runtime exceeds maximum number of domains\n");
+		return -EINVAL;
+	}
+
 	domid = parse_domid(argc, argv);
 	if (!domid) {
 		printk("Invalid domid passed to create cmd\n");
 		return -EINVAL;
 	}
 
+	struct xen_domain_cfg *domcfg = (domid == 1) ? &domd_cfg : &domu_cfg;
+	char *domdtdevs = (domid == 1) ? domd_dtdevs : domu_dtdevs;
+
 	memset(&config, 0, sizeof(config));
-	prepare_domain_cfg(&domd_cfg, &config);
+	prepare_domain_cfg(domcfg, &config);
 	config.grant_opts = XEN_DOMCTL_GRANT_version(1);
 
 	rc = xen_domctl_createdomain(domid, &config);
@@ -474,24 +550,22 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	__ASSERT(domain, "Can not allocate memory for domain struct");
 	memset(domain, 0, sizeof(*domain));
 	domain->domid = domid;
-	sys_dnode_init(&domain->node);
 
-	rc = xen_domctl_max_vcpus(domid, domd_cfg.max_vcpus);
+	rc = xen_domctl_max_vcpus(domid, domcfg->max_vcpus);
 	printk("Return code = %d max_vcpus\n", rc);
-	domain->num_vcpus = domd_cfg.max_vcpus;
+	domain->num_vcpus = domcfg->max_vcpus;
 
 	rc = xen_domctl_set_address_size(domid, 64);
 	printk("Return code = %d set_address_size\n", rc);
 	domain->address_size = 64;
 
-	domain->max_mem_kb =
-		domd_cfg.mem_kb + (domd_cfg.gnt_frames + NR_MAGIC_PAGES) * XEN_PAGE_SIZE;
+	domain->max_mem_kb = domcfg->mem_kb + (domcfg->gnt_frames + NR_MAGIC_PAGES) * XEN_PAGE_SIZE;
 	rc = xen_domctl_max_mem(domid, domain->max_mem_kb);
 
 	rc = allocate_domain_evtchns(domain);
 	printk("Return code = %d allocate_domain_evtchns\n", rc);
 
-	rc = prepare_domu_physmap(domid, base_pfn, &domd_cfg);
+	rc = prepare_domu_physmap(domid, base_pfn, domcfg);
 
 	ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET);
 
@@ -501,11 +575,11 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 		load_domd_dtb(domid, dtb_addr, __dtb_domu_start, __dtb_domu_end);
 	}
 
-	rc = share_domain_iomems(domid, domd_cfg.iomems, domd_cfg.nr_iomems);
+	rc = share_domain_iomems(domid, domcfg->iomems, domcfg->nr_iomems);
 
-	rc = bind_domain_irqs(domid, domd_cfg.irqs, domd_cfg.nr_irqs);
+	rc = bind_domain_irqs(domid, domcfg->irqs, domcfg->nr_irqs);
 
-	rc = assign_dtdevs(domid, domd_dtdevs, domd_cfg.nr_dtdevs);
+	rc = assign_dtdevs(domid, domdtdevs, domcfg->nr_dtdevs);
 
 	memset(&vcpu_ctx, 0, sizeof(vcpu_ctx));
 	vcpu_ctx.user_regs.x0 = dtb_addr;
@@ -537,11 +611,19 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	rc = xen_domctl_scheduler_op(domid, &sched_op);
 	printk("Return code = %d SCHEDOP_putinfo\n", rc);
 
-	/* TODO: lock here? */
+	k_mutex_lock(&dl_mutex, K_FOREVER);
+	sys_dnode_init(&domain->node);
 	sys_dlist_append(&domain_list, &domain->node);
-	rc = xen_domctl_unpausedomain(domid);
-	printk("Return code = %d XEN_DOMCTL_unpausedomain\n", rc);
+	k_mutex_unlock(&dl_mutex);
 
+	rc = map_domain_xenstore_ring(domain);
+
+	if (rc) {
+		printk("Unable to map domain xenstore ring, rc=%d\n", rc);
+		return rc;
+	}
+
+	start_domain_stored(domain);
 	/* TODO: do this on console creation */
 	rc = map_domain_console_ring(domain);
 	printk("map domain ring OK\n");
@@ -550,15 +632,104 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	}
 
 	/* TODO: for debug, remove this or set as optional */
+	init_domain_console(domain);
 	start_domain_console(domain);
+
+	do_write("/tool/xenstored", "");
+
+	char lbuffer[256] = { 0 };
+	char rbuffer[256] = { 0 };
+
+	char basepref[] = "/local/domain";
+
+	for (int i = 0; i < 4; ++i) {
+		sprintf(lbuffer, "%s/%d/cpu/%d/availability", basepref, domid, i);
+		do_write(lbuffer, "online");
+	}
+
+	sprintf(lbuffer, "%s/%d/memory/static-max", basepref, domid);
+	do_write(lbuffer, "524288");
+	sprintf(lbuffer, "%s/%d/memory/target", basepref, domid);
+	do_write(lbuffer, "524289");
+	sprintf(lbuffer, "%s/%d/memory/videoram", basepref, domid);
+	do_write(lbuffer, "-1");
+	sprintf(lbuffer, "%s/%d/control/platform-feature-multiprocessor-suspend", basepref, domid);
+	do_write(lbuffer, "1");
+	sprintf(lbuffer, "%s/%d/control/platform-feature-xs_reset_watches", basepref, domid);
+	do_write(lbuffer, "1");
+
+	char uuid[40];
+	snprintf(uuid, 40, "00000000-0000-0000-0000-%012d", domid);
+
+	sprintf(lbuffer, "%s/%d/vm", basepref, domid);
+	do_write(lbuffer, uuid);
+
+	sprintf(lbuffer, "/vm/%s/name", uuid);
+	sprintf(rbuffer, "zephyr-%d", domid);
+	do_write(lbuffer, rbuffer);
+	sprintf(lbuffer, "/local/domain/%d/name", domid);
+	do_write(lbuffer, rbuffer);
+	sprintf(lbuffer, "/vm/%s/start_time", uuid);
+	do_write(lbuffer, "0");
+	sprintf(lbuffer, "/vm/%s/uuid", uuid);
+	do_write(lbuffer, uuid);
+
+	sprintf(lbuffer, "%s/%d/domid", basepref, domid);
+	sprintf(rbuffer, "%d", domid);
+	do_write(lbuffer, rbuffer);
+
+	char *dirs[] = { "data",
+			 "drivers",
+			 "feature",
+			 "attr",
+			 "error",
+			 "control",
+			 "control/shutdown",
+			 "control/feature-poweroff",
+			 "control/feature-reboot",
+			 "control/feature-suspend",
+			 "control/sysrq",
+			 "device/vbd",
+			 "device/suspend/event-channel",
+			 NULL };
+	for (int i = 0; dirs[i]; ++i) {
+		sprintf(lbuffer, "%s/%d/%s", basepref, domid, dirs[i]);
+		do_write(lbuffer, "");
+	}
+
+	sprintf(lbuffer, "/libxl/%d/dm-version", domid);
+	do_write(lbuffer, "qemu_xen_traditional");
+	sprintf(lbuffer, "/libxl/%d/type", domid);
+	do_write(lbuffer, "pvh");
+
+	if (domid == 1) {
+		rc = xen_domctl_unpausedomain(domid);
+		printk("Return code = %d XEN_DOMCTL_unpausedomain\n", rc);
+	} else {
+		printk("Created domain is paused\nTo unpause issue: xu unpause -d %d\n", domid);
+	}
+
+	++dom_num;
+
 	return rc;
+}
+
+void unmap_domain_ring(void *p)
+{
+	xen_pfn_t ring_pfn = virt_to_pfn(p);
+	int rc = xendom_remove_from_physmap(DOMID_SELF, ring_pfn);
+	printk("Return code for xendom_remove_from_physmap = %d [%08p]\n", rc, p);
+
+	rc = xendom_populate_physmap(DOMID_SELF, 0, 1, 0, &ring_pfn);
+	printk("Return code for xendom_populate_physmap = %d [%08p]\n", rc, p);
+
+	k_free(p);
 }
 
 int domu_destroy(const struct shell *shell, size_t argc, char **argv)
 {
 	int rc;
 	uint32_t domid = 0;
-	xen_pfn_t ring_pfn;
 	struct xen_domain *domain = NULL;
 
 	if (argc < 3 || argc > 4) {
@@ -567,33 +738,34 @@ int domu_destroy(const struct shell *shell, size_t argc, char **argv)
 
 	domid = parse_domid(argc, argv);
 	if (!domid) {
-		printk("Invalid domid passed to destroy cmd\n");
+		shell_error(shell, "Invalid domid passed to destroy cmd\n");
 		return -EINVAL;
 	}
 
 	domain = domid_to_domain(domid);
 	if (!domain) {
-		printk("No domain with domid = %u is present\n", domid);
+		shell_error(shell, "No domain with domid = %u is present\n", domid);
 		/* Domain with requested domid is not present in list */
 		return -EINVAL;
 	}
 
+	stop_domain_stored(domain);
 	/* TODO: do this on console destroying */
-	stop_domain_console();
-	ring_pfn = virt_to_pfn(domain->intf);
-	rc = xendom_remove_from_physmap(DOMID_SELF, ring_pfn);
-	printk("Return code for xendom_remove_from_physmap = %d, (console ring)\n", rc);
+	stop_domain_console(domain);
 
-	rc = xendom_populate_physmap(DOMID_SELF, 0, 1, 0, &ring_pfn);
-	printk("Return code for xendom_populate_physmap = %d, (console ring)\n", rc);
-
-	k_free(domain->intf);
+	unmap_domain_ring(domain->intf);
+	unmap_domain_ring(domain->domint);
 
 	rc = xen_domctl_destroydomain(domid);
-	printk("Return code = %d XEN_DOMCTL_destroydomain\n", rc);
+	shell_print(shell, "Return code = %d XEN_DOMCTL_destroydomain\n", rc);
 
+	k_mutex_lock(&dl_mutex, K_FOREVER);
 	sys_dlist_remove(&domain->node);
+	k_mutex_unlock(&dl_mutex);
+
 	k_free(domain);
+
+	--dom_num;
 
 	return rc;
 }
@@ -658,5 +830,5 @@ int domu_unpause(const struct shell *shell, size_t argc, char **argv)
 
 void main(void)
 {
-	/* Nothing to do on app start */
+	init_root();
 }

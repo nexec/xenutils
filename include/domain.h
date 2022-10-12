@@ -4,7 +4,6 @@
 #include <xen/events.h>
 #include <xen/generic.h>
 
-
 struct xen_domain_iomem {
 	/* where to map, if 0 - map to same place as mfn */
 	uint64_t first_gfn;
@@ -41,12 +40,29 @@ struct xen_domain_cfg {
 struct xen_domain {
 	uint32_t domid;
 	struct xencons_interface *intf;
+	struct xenstore_domain_interface *domint;
 	int num_vcpus;
 	int address_size;
 	uint64_t max_mem_kb;
 	sys_dnode_t node;
+	int stack_slot;
+
+	struct k_sem console_sem;
+	struct k_thread console_thrd;
+	k_tid_t console_tid;
+	bool console_thrd_stop;
 	evtchn_port_t console_evtchn;
+	evtchn_port_t local_console_evtchn;
+
+	struct k_sem xb_sem;
+	struct k_thread xenbus_thrd;
+	k_tid_t xenbus_tid;
+	bool xenbus_thrd_stop;
 	evtchn_port_t xenbus_evtchn;
+	evtchn_port_t local_xenbus_evtchn;
+
+	int transaction;
+	int stop_transaction_id;
 };
 
 #endif /* XENUTILS_DOMAIN_H */
