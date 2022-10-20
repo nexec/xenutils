@@ -425,13 +425,10 @@ void process_pending_watch_events(struct xen_domain *domain, uint32_t id)
 	k_mutex_lock(&pfl_mutex, K_FOREVER);
 
 	SYS_DLIST_FOR_EACH_CONTAINER_SAFE (&pending_watch_event_list, iter, next, node) {
-		if (domain->domid == iter->domid) {
-			if (fire_watcher(domain, id, iter->key)) {
-				k_free(iter->key);
-				sys_dlist_remove(&iter->node);
-				k_free(iter);
-				k_mutex_unlock(&pfl_mutex);
-			}
+		if (domain->domid == iter->domid && fire_watcher(domain, id, iter->key)) {
+			k_free(iter->key);
+			sys_dlist_remove(&iter->node);
+			k_free(iter);
 		}
 	}
 
