@@ -186,7 +186,8 @@ void send_reply_sz(struct xen_domain *domain, uint32_t id, uint32_t msg_type, co
 	struct xenstore_domain_interface *intf = domain->domint;
 
 	if (check_indexes(intf->rsp_cons, intf->rsp_prod)) {
-		intf->rsp_prod = intf->rsp_cons = 0;
+		intf->rsp_cons = 0;
+		intf->rsp_prod = 0;
 	}
 
 	struct xsd_sockmsg h = { .req_id = id, .type = msg_type, .len = sz };
