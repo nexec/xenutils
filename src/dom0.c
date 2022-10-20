@@ -444,14 +444,6 @@ uint32_t parse_domid(size_t argc, char **argv)
 	return 0;
 }
 
-extern int init_domain_console(struct xen_domain *domain);
-extern int start_domain_console(struct xen_domain *domain);
-extern int stop_domain_console(struct xen_domain *domain);
-
-extern void init_root(void);
-extern int start_domain_stored(struct xen_domain *domain);
-extern int stop_domain_stored(struct xen_domain *domain);
-
 int domu_console_start(const struct shell *shell, size_t argc, char **argv)
 {
 	uint32_t domid = 0;
