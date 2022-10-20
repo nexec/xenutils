@@ -495,6 +495,75 @@ int domu_console_stop(const struct shell *shell, size_t argc, char **argv)
 	return stop_domain_console(domain);
 }
 
+void initialize_xenstore(uint32_t domid)
+{
+	char lbuffer[256] = { 0 };
+	char rbuffer[256] = { 0 };
+	char uuid[40];
+	char basepref[] = "/local/domain";
+	char *dirs[] = { "data",
+			 "drivers",
+			 "feature",
+			 "attr",
+			 "error",
+			 "control",
+			 "control/shutdown",
+			 "control/feature-poweroff",
+			 "control/feature-reboot",
+			 "control/feature-suspend",
+			 "control/sysrq",
+			 "device/vbd",
+			 "device/suspend/event-channel",
+			 NULL };
+
+	snprintf(uuid, 40, "00000000-0000-0000-0000-%012d", domid);
+
+	do_write("/tool/xenstored", "");
+
+	for (int i = 0; i < 4; ++i) {
+		sprintf(lbuffer, "%s/%d/cpu/%d/availability", basepref, domid, i);
+		do_write(lbuffer, "online");
+	}
+
+	sprintf(lbuffer, "%s/%d/memory/static-max", basepref, domid);
+	do_write(lbuffer, "524288");
+	sprintf(lbuffer, "%s/%d/memory/target", basepref, domid);
+	do_write(lbuffer, "524289");
+	sprintf(lbuffer, "%s/%d/memory/videoram", basepref, domid);
+	do_write(lbuffer, "-1");
+	sprintf(lbuffer, "%s/%d/control/platform-feature-multiprocessor-suspend", basepref, domid);
+	do_write(lbuffer, "1");
+	sprintf(lbuffer, "%s/%d/control/platform-feature-xs_reset_watches", basepref, domid);
+	do_write(lbuffer, "1");
+
+	sprintf(lbuffer, "%s/%d/vm", basepref, domid);
+	do_write(lbuffer, uuid);
+
+	sprintf(lbuffer, "/vm/%s/name", uuid);
+	sprintf(rbuffer, "zephyr-%d", domid);
+	do_write(lbuffer, rbuffer);
+	sprintf(lbuffer, "/local/domain/%d/name", domid);
+	do_write(lbuffer, rbuffer);
+	sprintf(lbuffer, "/vm/%s/start_time", uuid);
+	do_write(lbuffer, "0");
+	sprintf(lbuffer, "/vm/%s/uuid", uuid);
+	do_write(lbuffer, uuid);
+
+	sprintf(lbuffer, "%s/%d/domid", basepref, domid);
+	sprintf(rbuffer, "%d", domid);
+	do_write(lbuffer, rbuffer);
+
+	for (int i = 0; dirs[i]; ++i) {
+		sprintf(lbuffer, "%s/%d/%s", basepref, domid, dirs[i]);
+		do_write(lbuffer, "");
+	}
+
+	sprintf(lbuffer, "/libxl/%d/dm-version", domid);
+	do_write(lbuffer, "qemu_xen_traditional");
+	sprintf(lbuffer, "/libxl/%d/type", domid);
+	do_write(lbuffer, "pvh");
+}
+
 #define LOAD_ADDR_OFFSET 0x80000
 int domu_create(const struct shell *shell, size_t argc, char **argv)
 {
@@ -628,72 +697,7 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	init_domain_console(domain);
 	start_domain_console(domain);
 
-	do_write("/tool/xenstored", "");
-
-	char lbuffer[256] = { 0 };
-	char rbuffer[256] = { 0 };
-
-	char basepref[] = "/local/domain";
-
-	for (int i = 0; i < 4; ++i) {
-		sprintf(lbuffer, "%s/%d/cpu/%d/availability", basepref, domid, i);
-		do_write(lbuffer, "online");
-	}
-
-	sprintf(lbuffer, "%s/%d/memory/static-max", basepref, domid);
-	do_write(lbuffer, "524288");
-	sprintf(lbuffer, "%s/%d/memory/target", basepref, domid);
-	do_write(lbuffer, "524289");
-	sprintf(lbuffer, "%s/%d/memory/videoram", basepref, domid);
-	do_write(lbuffer, "-1");
-	sprintf(lbuffer, "%s/%d/control/platform-feature-multiprocessor-suspend", basepref, domid);
-	do_write(lbuffer, "1");
-	sprintf(lbuffer, "%s/%d/control/platform-feature-xs_reset_watches", basepref, domid);
-	do_write(lbuffer, "1");
-
-	char uuid[40];
-	snprintf(uuid, 40, "00000000-0000-0000-0000-%012d", domid);
-
-	sprintf(lbuffer, "%s/%d/vm", basepref, domid);
-	do_write(lbuffer, uuid);
-
-	sprintf(lbuffer, "/vm/%s/name", uuid);
-	sprintf(rbuffer, "zephyr-%d", domid);
-	do_write(lbuffer, rbuffer);
-	sprintf(lbuffer, "/local/domain/%d/name", domid);
-	do_write(lbuffer, rbuffer);
-	sprintf(lbuffer, "/vm/%s/start_time", uuid);
-	do_write(lbuffer, "0");
-	sprintf(lbuffer, "/vm/%s/uuid", uuid);
-	do_write(lbuffer, uuid);
-
-	sprintf(lbuffer, "%s/%d/domid", basepref, domid);
-	sprintf(rbuffer, "%d", domid);
-	do_write(lbuffer, rbuffer);
-
-	char *dirs[] = { "data",
-			 "drivers",
-			 "feature",
-			 "attr",
-			 "error",
-			 "control",
-			 "control/shutdown",
-			 "control/feature-poweroff",
-			 "control/feature-reboot",
-			 "control/feature-suspend",
-			 "control/sysrq",
-			 "device/vbd",
-			 "device/suspend/event-channel",
-			 NULL };
-	for (int i = 0; dirs[i]; ++i) {
-		sprintf(lbuffer, "%s/%d/%s", basepref, domid, dirs[i]);
-		do_write(lbuffer, "");
-	}
-
-	sprintf(lbuffer, "/libxl/%d/dm-version", domid);
-	do_write(lbuffer, "qemu_xen_traditional");
-	sprintf(lbuffer, "/libxl/%d/type", domid);
-	do_write(lbuffer, "pvh");
+	initialize_xenstore(domid);
 
 	if (domid == DOMID_DOMD) {
 		rc = xen_domctl_unpausedomain(domid);

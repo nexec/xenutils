@@ -157,19 +157,19 @@ void write_xb(struct xenstore_domain_interface *intf, uint8_t *data, uint32_t le
 	} while (len > 0 && len < XENSTORE_RING_SIZE);
 }
 
-void read_xb(struct xenstore_domain_interface *intf, uint8_t *data, uint32_t len)
+uint32_t read_xb(struct xen_domain *domain, uint8_t *data, uint32_t len)
 {
 	uint32_t blen = 0;
 	uint32_t offset = 0;
+	struct xenstore_domain_interface *intf = domain->domint;
 
 	do {
-		uint32_t ring_offset = get_input_offset(intf->req_cons, intf->req_prod, &blen);
+		uint32_t prod = intf->req_prod;
+		uint32_t ring_offset = get_input_offset(intf->req_cons, prod, &blen);
 
 		if (blen == 0) {
-			intf->req_cons = 0;
-			intf->req_prod = 0;
-			k_sleep(K_MSEC(100));
-			continue;
+			notify_evtchn(domain->local_xenbus_evtchn);
+			return 0;
 		}
 
 		uint32_t effect = (blen > len) ? len : blen;
@@ -178,6 +178,8 @@ void read_xb(struct xenstore_domain_interface *intf, uint8_t *data, uint32_t len
 		len -= effect;
 		intf->req_cons += effect;
 	} while (len > 0);
+
+	return offset;
 }
 
 void send_reply_sz(struct xen_domain *domain, uint32_t id, uint32_t msg_type, const char *payload,
@@ -188,6 +190,7 @@ void send_reply_sz(struct xen_domain *domain, uint32_t id, uint32_t msg_type, co
 	if (check_indexes(intf->rsp_cons, intf->rsp_prod)) {
 		intf->rsp_cons = 0;
 		intf->rsp_prod = 0;
+			printk("%d waitin2g for xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 	}
 
 	struct xsd_sockmsg h = { .req_id = id, .type = msg_type, .len = sz };
@@ -653,12 +656,14 @@ void handle_get_domain_path(struct xen_domain *domain, uint32_t id, char *payloa
 void xb_chn_cb(void *priv)
 {
 	struct xen_domain *domain = (struct xen_domain *)priv;
+	struct xenstore_domain_interface *intf = domain->domint;
+			printk("%d notify xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 	k_sem_give(&domain->xb_sem);
 }
 
 int start_domain_stored(struct xen_domain *domain)
 {
-	k_sem_init(&domain->xb_sem, 1, 1);
+	k_sem_init(&domain->xb_sem, 0, 1);
 	domain->local_xenbus_evtchn = evtchn_bind_interdomain(domain->domid, domain->xenbus_evtchn);
 
 	bind_event_channel(domain->local_xenbus_evtchn, xb_chn_cb, (void *)domain);
@@ -710,6 +715,8 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 	struct xen_domain *domain = p1;
 	struct xenstore_domain_interface *intf = domain->domint;
 	char input_buffer[XENSTORE_RING_SIZE];
+	uint32_t sz;
+	uint32_t delta;
 
 	domain->transaction = 0;
 	domain->stop_transaction_id = 0;
@@ -718,9 +725,15 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 		if (!sys_dlist_is_empty(&pending_watch_event_list) &&
 		    intf->rsp_cons == intf->rsp_prod && intf->req_cons == intf->req_prod) {
 			process_pending_watch_events(domain, 0);
+		notify_evtchn(domain->local_xenbus_evtchn);
 		}
 
-		k_sem_take(&domain->xb_sem, K_MSEC(20));
+//		if (check_indexes(intf->req_cons, intf->req_prod))
+		if (intf->req_cons == intf->req_prod)
+		{
+			printk("%d waiting for xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
+		k_sem_take(&domain->xb_sem, K_FOREVER);
+		}
 
 		XENSTORE_RING_IDX cons = intf->req_cons;
 		XENSTORE_RING_IDX prod = intf->req_prod;
@@ -744,8 +757,18 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 
 		struct xsd_sockmsg *header = input_buffer;
 
-		read_xb(intf, input_buffer, sizeof(struct xsd_sockmsg));
-		read_xb(intf, (uint8_t *)(header + 1), header->len);
+		if (read_xb(domain, input_buffer, sizeof(struct xsd_sockmsg)) == 0)
+		{
+			continue;
+		}
+
+		sz = 0;
+
+		do
+		{
+		delta = read_xb(domain, (uint8_t *)header + sizeof(struct xsd_sockmsg) + sz, header->len);
+		sz += delta;
+		} while (sz < header->len);
 
 		if (message_handlers[header->type].h == NULL) {
 			printk("Unsupported message type: %d\n", header->type);
@@ -755,6 +778,7 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 							 (char *)(header + 1), header->len);
 		}
 
+		printk("%d notifying xenbus, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 		notify_evtchn(domain->local_xenbus_evtchn);
 	}
 }
