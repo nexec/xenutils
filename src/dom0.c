@@ -35,6 +35,7 @@
 static int dom_num = 0;
 
 #define STACK_SIZE_PER_DOM (32 * 1024)
+#define DOMID_DOMD 1
 
 static sys_dlist_t domain_list = SYS_DLIST_STATIC_INIT(&domain_list);
 K_MUTEX_DEFINE(dl_mutex);
@@ -525,8 +526,8 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	struct xen_domain_cfg *domcfg = (domid == 1) ? &domd_cfg : &domu_cfg;
-	char *domdtdevs = (domid == 1) ? domd_dtdevs : domu_dtdevs;
+	struct xen_domain_cfg *domcfg = (domid == DOMID_DOMD) ? &domd_cfg : &domu_cfg;
+	char *domdtdevs = (domid == DOMID_DOMD) ? domd_dtdevs : domu_dtdevs;
 
 	memset(&config, 0, sizeof(config));
 	prepare_domain_cfg(domcfg, &config);
@@ -561,7 +562,7 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 
 	ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET);
 
-	if (domid == 1) {
+	if (domid == DOMID_DOMD) {
 		load_domd_dtb(domid, dtb_addr, __dtb_domd_start, __dtb_domd_end);
 	} else {
 		load_domd_dtb(domid, dtb_addr, __dtb_domu_start, __dtb_domu_end);
@@ -694,7 +695,7 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	sprintf(lbuffer, "/libxl/%d/type", domid);
 	do_write(lbuffer, "pvh");
 
-	if (domid == 1) {
+	if (domid == DOMID_DOMD) {
 		rc = xen_domctl_unpausedomain(domid);
 		printk("Return code = %d XEN_DOMCTL_unpausedomain\n", rc);
 	} else {
