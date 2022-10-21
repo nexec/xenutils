@@ -190,7 +190,6 @@ void send_reply_sz(struct xen_domain *domain, uint32_t id, uint32_t msg_type, co
 	if (check_indexes(intf->rsp_cons, intf->rsp_prod)) {
 		intf->rsp_cons = 0;
 		intf->rsp_prod = 0;
-			printk("%d waitin2g for xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 	}
 
 	struct xsd_sockmsg h = { .req_id = id, .type = msg_type, .len = sz };
@@ -728,11 +727,9 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 		notify_evtchn(domain->local_xenbus_evtchn);
 		}
 
-//		if (check_indexes(intf->req_cons, intf->req_prod))
 		if (intf->req_cons == intf->req_prod)
 		{
-			printk("%d waiting for xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
-		k_sem_take(&domain->xb_sem, K_FOREVER);
+			k_sem_take(&domain->xb_sem, K_FOREVER);
 		}
 
 		XENSTORE_RING_IDX cons = intf->req_cons;
@@ -757,7 +754,20 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 
 		struct xsd_sockmsg *header = input_buffer;
 
-		if (read_xb(domain, input_buffer, sizeof(struct xsd_sockmsg)) == 0)
+		sz = 0;
+
+		do {
+			delta = read_xb(domain, (uint8_t *)input_buffer + sz, sizeof(struct xsd_sockmsg));
+			if (delta == 0)
+			{
+				/* Missing header data, nothing to do */
+				break;
+			}
+
+			sz += delta;
+		} while (sz < sizeof(struct xsd_sockmsg));
+
+		if (sz == 0)
 		{
 			continue;
 		}
@@ -766,8 +776,8 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 
 		do
 		{
-		delta = read_xb(domain, (uint8_t *)header + sizeof(struct xsd_sockmsg) + sz, header->len);
-		sz += delta;
+			delta = read_xb(domain, (uint8_t *)input_buffer + sizeof(struct xsd_sockmsg) + sz, header->len);
+			sz += delta;
 		} while (sz < header->len);
 
 		if (message_handlers[header->type].h == NULL) {
