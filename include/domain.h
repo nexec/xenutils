@@ -62,7 +62,9 @@ struct xen_domain {
 	evtchn_port_t local_xenbus_evtchn;
 
 	int transaction;
+	int running_transaction;
 	int stop_transaction_id;
+	bool pending_stop_transaction;
 };
 
 #endif /* XENUTILS_DOMAIN_H */

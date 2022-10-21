@@ -154,7 +154,7 @@ void write_xb(struct xenstore_domain_interface *intf, uint8_t *data, uint32_t le
 		offset += effect;
 		len -= effect;
 		intf->rsp_prod += effect;
-	} while (len > 0 && len < XENSTORE_RING_SIZE);
+	} while (len > 0);
 }
 
 uint32_t read_xb(struct xen_domain *domain, uint8_t *data, uint32_t len)
@@ -363,6 +363,22 @@ void do_write(char *path, char *data)
 	k_mutex_unlock(&xsel_mutex);
 }
 
+//TODO: header, moveto dom0.c
+void notify_sibling_domains(uint32_t *sdom_list, size_t len)
+{
+	struct xen_domain *iter;
+
+	for (size_t sdi=0;sdom_list[sdi];++sdi)
+	{
+		iter = domid_to_domain(sdom_list[sdi]);
+
+		if (iter)
+		{
+			xb_chn_cb(iter);
+		}
+	}
+}
+
 void _handle_write(struct xen_domain *domain, uint32_t id, uint32_t msg_type, char *payload,
 		   uint32_t len)
 {
@@ -391,6 +407,7 @@ void _handle_write(struct xen_domain *domain, uint32_t id, uint32_t msg_type, ch
 
 	struct watch_entry *iter;
 
+	uint32_t sibling_domains[DOM_MAX] = {0};
 	k_mutex_lock(&wel_mutex, K_FOREVER);
 	SYS_DLIST_FOR_EACH_CONTAINER (&watch_entry_list, iter, node) {
 		uint32_t iklen = strlen(iter->key);
@@ -402,6 +419,19 @@ void _handle_write(struct xen_domain *domain, uint32_t id, uint32_t msg_type, ch
 			memcpy(entry->key, path, keyl);
 			entry->key[keyl - 1] = 0;
 			entry->domid = iter->domid;
+
+			if (iter->domid != domain->domid)
+			{
+				for (size_t sdi=0;sdi<DOM_MAX;++sdi)
+				{
+					if (sibling_domains[sdi] == 0 || sibling_domains[sdi] == iter->domid)
+					{
+						sibling_domains[sdi] = iter->domid;
+						break;
+					}
+				}
+			}
+
 			k_mutex_lock(&pfl_mutex, K_FOREVER);
 			sys_dnode_init(&entry->node);
 			sys_dlist_append(&pending_watch_event_list, &entry->node);
@@ -410,6 +440,8 @@ void _handle_write(struct xen_domain *domain, uint32_t id, uint32_t msg_type, ch
 	}
 
 	k_mutex_unlock(&wel_mutex);
+
+	notify_sibling_domains(sibling_domains, DOM_MAX);
 }
 
 void handle_write(struct xen_domain *domain, uint32_t id, char *payload, uint32_t len)
@@ -428,7 +460,11 @@ void process_pending_watch_events(struct xen_domain *domain, uint32_t id)
 	k_mutex_lock(&pfl_mutex, K_FOREVER);
 
 	SYS_DLIST_FOR_EACH_CONTAINER_SAFE (&pending_watch_event_list, iter, next, node) {
-		if (domain->domid == iter->domid && fire_watcher(domain, id, iter->key)) {
+		if (domain->domid == iter->domid && domain->running_transaction == 0 && fire_watcher(domain, id, iter->key)) {
+			if (domain->pending_stop_transaction == true && domain->stop_transaction_id == 0)
+			{
+				continue;
+			}
 			k_free(iter->key);
 			sys_dlist_remove(&iter->node);
 			k_free(iter);
@@ -484,6 +520,8 @@ void handle_read(struct xen_domain *domain, uint32_t id, char *payload, uint32_t
 	} else {
 		snprintf(path, 128, "/local/domain/%d/%s", domain->domid, payload);
 	}
+
+	struct xenstore_domain_interface *intf = domain->domint;
 
 	struct xs_entry *entry = key_to_entry(path);
 
@@ -632,15 +670,25 @@ void handle_unwatch(struct xen_domain *domain, uint32_t id, char *payload, uint3
 void handle_transaction_start(struct xen_domain *domain, uint32_t id, char *payload, uint32_t len)
 {
 	char buf[8] = { 0 };
-	snprintf(buf, 8, "%d", ++domain->transaction);
+
+	if (domain->running_transaction)
+	{
+		printk("%d: There are already running transaction\n", domain->domid);
+		send_errno(domain, id, EBUSY);
+		return;
+	}
+
+	domain->running_transaction = ++domain->transaction;
+	snprintf(buf, 8, "%d", domain->running_transaction);
 	send_reply(domain, id, XS_TRANSACTION_START, buf);
 }
 
 void handle_transaction_stop(struct xen_domain *domain, uint32_t id, char *payload, uint32_t len)
 {
 	// TODO check contents, transaction completion, etc
-	domain->transaction = 0;
 	domain->stop_transaction_id = id;
+	domain->pending_stop_transaction = true;
+	domain->running_transaction = 0;
 }
 
 void handle_get_domain_path(struct xen_domain *domain, uint32_t id, char *payload, uint32_t len)
@@ -655,8 +703,6 @@ void handle_get_domain_path(struct xen_domain *domain, uint32_t id, char *payloa
 void xb_chn_cb(void *priv)
 {
 	struct xen_domain *domain = (struct xen_domain *)priv;
-	struct xenstore_domain_interface *intf = domain->domint;
-			printk("%d notify xb_sem, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 	k_sem_give(&domain->xb_sem);
 }
 
@@ -673,7 +719,6 @@ int start_domain_stored(struct xen_domain *domain)
 	}
 
 	domain->xenbus_thrd_stop = false;
-	compiler_barrier();
 
 	int slot = 0;
 	for (; slot < DOM_MAX && stack_slots[slot] != 0; ++slot)
@@ -718,38 +763,24 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 	uint32_t delta;
 
 	domain->transaction = 0;
+	domain->running_transaction = 0;
 	domain->stop_transaction_id = 0;
+	domain->pending_stop_transaction = false;
 
 	while (!domain->xenbus_thrd_stop) {
-		if (!sys_dlist_is_empty(&pending_watch_event_list) &&
-		    intf->rsp_cons == intf->rsp_prod && intf->req_cons == intf->req_prod) {
-			process_pending_watch_events(domain, 0);
-		notify_evtchn(domain->local_xenbus_evtchn);
+		if (!sys_dlist_is_empty(&pending_watch_event_list)){
+			process_pending_watch_events(domain, domain->running_transaction);
 		}
 
-		if (intf->req_cons == intf->req_prod)
-		{
-			k_sem_take(&domain->xb_sem, K_FOREVER);
-		}
-
-		XENSTORE_RING_IDX cons = intf->req_cons;
-		XENSTORE_RING_IDX prod = intf->req_prod;
-		XENSTORE_RING_IDX rsp_cons = intf->rsp_cons;
-		XENSTORE_RING_IDX rsp_prod = intf->rsp_prod;
-
-		if (domain->stop_transaction_id && rsp_cons == rsp_prod) {
+		if (domain->pending_stop_transaction) {
 			send_reply(domain, domain->stop_transaction_id, XS_TRANSACTION_END, "");
 			domain->stop_transaction_id = 0;
+			domain->pending_stop_transaction = false;
 		}
 
-		if ((rsp_cons != rsp_prod || !sys_dlist_is_empty(&pending_watch_event_list)) &&
-			    cons == prod ||
-		    domain->stop_transaction_id) {
-			continue;
-		}
-
-		if (check_indexes(cons, prod)) {
-			continue;
+		if (intf->req_prod <= intf->req_cons)
+		{
+			k_sem_take(&domain->xb_sem, K_FOREVER);
 		}
 
 		struct xsd_sockmsg *header = input_buffer;
@@ -758,9 +789,11 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 
 		do {
 			delta = read_xb(domain, (uint8_t *)input_buffer + sz, sizeof(struct xsd_sockmsg));
+
 			if (delta == 0)
 			{
-				/* Missing header data, nothing to do */
+				/* Missing header data, nothing to read. Perhaps pending watch event from
+				 * different domain. */
 				break;
 			}
 
@@ -769,6 +802,7 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 
 		if (sz == 0)
 		{
+			/* Skip message body processing */
 			continue;
 		}
 
@@ -788,7 +822,6 @@ void xenbus_evt_thrd(void *p1, void *p2, void *p3)
 							 (char *)(header + 1), header->len);
 		}
 
-		printk("%d notifying xenbus, req_prod=%d, req_cons=%d, rsp_prod=%d, rsp_cons=%d\n", domain->domid, intf->req_prod, intf->req_cons, intf->rsp_prod, intf->rsp_cons);
 		notify_evtchn(domain->local_xenbus_evtchn);
 	}
 }
