@@ -7,7 +7,7 @@ manifest:
       url-base: https://github.com/nexec/
 
   projects:
-    - name: xenutils
+    - name: xenutils_dom0
       remote: nexec_zephyr_dom0
       repo-path: xenutils.git
       revision: xen_dom0_demo
