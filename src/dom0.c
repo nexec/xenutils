@@ -180,10 +180,10 @@ static int prepare_domu_physmap(int domid, uint64_t base_pfn, struct xen_domain_
 	return 0;
 }
 
-extern char __kernel_domd_start[];
-extern char __kernel_domd_end[];
-extern char __uboot_domu_start[];
-extern char __uboot_domu_end[];
+extern char __img_domd_start[];
+extern char __img_domd_end[];
+extern char __img_domu_start[];
+extern char __img_domu_end[];
 uint64_t load_domd_image(int domid, uint64_t base_addr, const char *img_start, const char *img_end)
 {
 	int i, rc;
@@ -649,10 +649,10 @@ int domu_create(const struct shell *shell, size_t argc, char **argv)
 	rc = prepare_domu_physmap(domid, base_pfn, domcfg);
 
 	if (domid == DOMID_DOMD) {
-		ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET, __kernel_domd_start, __kernel_domd_end);
+		ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET, __img_domd_start, __img_domd_end);
 		load_domd_dtb(domid, dtb_addr, __dtb_domd_start, __dtb_domd_end);
 	} else {
-		ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET, __uboot_domu_start, __uboot_domu_end);
+		ventry = load_domd_image(domid, base_addr + LOAD_ADDR_OFFSET, __img_domu_start, __img_domu_end);
 		load_domd_dtb(domid, dtb_addr, __dtb_domu_start, __dtb_domu_end);
 	}
 
