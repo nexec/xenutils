@@ -12,9 +12,9 @@ manifest:
       repo-path: xenutils.git
       revision: xen_dom0_demo
     - name: zephyr
-      import: true
+      import: false
       remote: nexec_zephyr_dom0
       repo-path: zephyr.git
-      revision: v3.1.0_xendom0
+      revision: v3.1.0_dom0_demo
       west-commands: scripts/west-commands.yml
 

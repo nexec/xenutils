@@ -137,6 +137,7 @@ void write_xb(struct xenstore_domain_interface *intf, uint8_t *data, uint32_t le
 		size_t tail = get_output_offset(intf->rsp_cons, intf->rsp_prod, &blen);
 
 		if (blen == 0) {
+			k_sleep(K_MSEC(10));
 			continue;
 		}
 
@@ -160,6 +161,8 @@ size_t read_xb(struct xen_domain *domain, uint8_t *data, uint32_t len)
 
 		if (blen == 0) {
 			notify_evtchn(domain->local_xenstore_evtchn);
+			k_sleep(K_MSEC(10));
+			continue;
 			return 0;
 		}
 
@@ -762,7 +765,8 @@ void xenstore_evt_thrd(void *p1, void *p2, void *p3)
 
 		if (intf->req_prod <= intf->req_cons)
 		{
-			k_sem_take(&domain->xb_sem, K_FOREVER);
+			k_sem_take(&domain->xb_sem, K_MSEC(20));
+//			k_sem_take(&domain->xb_sem, K_FOREVER);
 		}
 
 		header = (struct xsd_sockmsg*)input_buffer;
