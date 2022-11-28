@@ -12,6 +12,7 @@ manifest:
       repo-path: xenutils.git
       revision: xen_dom0_demo
     - name: zephyr
+      import: true
       remote: nexec_zephyr_dom0
       repo-path: zephyr.git
       revision: v3.1.0_xendom0
